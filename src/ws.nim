@@ -1,6 +1,28 @@
 import httputils, strutils, base64, std/sha1, ./random, http, uri,
   chronos/timer, tables, stew/byteutils, eth/[keys], stew/endians2,
-  parseutils, stew/base64 as stewBase,chronos
+  parseutils, stew/base64 as stewBase, chronos
+
+  #[
+  +---------------------------------------------------------------+
+  |0                   1                   2                   3  |
+  |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
+  +-+-+-+-+-------+-+-------------+-------------------------------+
+  |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+  |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+  |N|V|V|V|       |S|             |   (if payload len==126/127)   |
+  | |1|2|3|       |K|             |                               |
+  +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+  |     Extended payload length continued, if payload len == 127  |
+  + - - - - - - - - - - - - - - - +-------------------------------+
+  |                               |Masking-key, if MASK set to 1  |
+  +-------------------------------+-------------------------------+
+  | Masking-key (continued)       |          Payload Data         |
+  +-------------------------------- - - - - - - - - - - - - - - - +
+  :                     Payload Data continued ...                :
+  + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+  |                     Payload Data continued ...                |
+  +---------------------------------------------------------------+
+  ]#
 
 const
   SHA1DigestSize = 20
@@ -13,15 +35,6 @@ type
     Open = 1       # The connection is open and ready to communicate.
     Closing = 2    # The connection is in the process of closing.
     Closed = 3     # The connection is closed or couldn't be opened.
-
-  WebSocket* = ref object
-    tcpSocket*: StreamTransport
-    version*: int
-    key*: string
-    protocol*: string
-    readyState*: ReadyState
-    masked*: bool # send masked packets
-    rng*: ref BrHmacDrbgContext
 
   WebSocketError* = object of IOError
 
@@ -38,8 +51,44 @@ type
   HttpCode* = enum
     Http101 = 101 # Switching Protocols
 
+  Opcode* {.pure.} = enum
+    ## 4 bits. Defines the interpretation of the "Payload data".
+    Cont = 0x0   ## Denotes a continuation frame.
+    Text = 0x1   ## Denotes a text frame.
+    Binary = 0x2 ## Denotes a binary frame.
+    # 3-7 are reserved for further non-control frames.
+    Close = 0x8  ## Denotes a connection close.
+    Ping = 0x9   ## Denotes a ping.
+    Pong = 0xa   ## Denotes a pong.
+    # B-F are reserved for further control frames.
+
+  Frame = ref object
+    fin: bool                 ## Indicates that this is the final fragment in a message.
+    rsv1: bool                ## MUST be 0 unless negotiated that defines meanings
+    rsv2: bool                ## MUST be 0
+    rsv3: bool                ## MUST be 0
+    opcode: Opcode            ## Defines the interpretation of the "Payload data".
+    mask: bool                ## Defines whether the "Payload data" is masked.
+    data: seq[byte]           ## Payload data
+    maskKey: array[4, char]   ## Masking key
+    length: uint64            ## Message size.
+    consumed: uint64          ## how much has been consumed from the frame
+
+  WebSocket* = ref object
+    tcpSocket*: StreamTransport
+    version*: int
+    key*: string
+    protocol*: string
+    readyState*: ReadyState
+    masked*: bool # send masked packets
+    rng*: ref BrHmacDrbgContext
+    frame: Frame
+
+func remainder(frame: Frame): uint64 =
+  frame.length - frame.consumed
+
 # Forward declare
-proc close*(ws: WebSocket, initiator: bool = true)  {.async.}
+proc close*(ws: WebSocket, initiator: bool = true) {.async.}
 
 proc handshake*(ws: WebSocket, header: HttpRequestHeader) {.async.} =
   ## Handles the websocket handshake.
@@ -94,61 +143,6 @@ proc newWebSocket*(header: HttpRequestHeader, transp: StreamTransport,
       WebSocketError,
       "Failed to create WebSocket from request: " & getCurrentExceptionMsg()
     )
-
-type
-  Opcode* = enum
-    ## 4 bits. Defines the interpretation of the "Payload data".
-    Cont = 0x0   ## Denotes a continuation frame.
-    Text = 0x1   ## Denotes a text frame.
-    Binary = 0x2 ## Denotes a binary frame.
-    # 3-7 are reserved for further non-control frames.
-    Close = 0x8  ## Denotes a connection close.
-    Ping = 0x9   ## Denotes a ping.
-    Pong = 0xa   ## Denotes a pong.
-    # B-F are reserved for further control frames.
-
-  #[
-  +---------------------------------------------------------------+
-  |0                   1                   2                   3  |
-  |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
-  +-+-+-+-+-------+-+-------------+-------------------------------+
-  |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
-  |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
-  |N|V|V|V|       |S|             |   (if payload len==126/127)   |
-  | |1|2|3|       |K|             |                               |
-  +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
-  |     Extended payload length continued, if payload len == 127  |
-  + - - - - - - - - - - - - - - - +-------------------------------+
-  |                               |Masking-key, if MASK set to 1  |
-  +-------------------------------+-------------------------------+
-  | Masking-key (continued)       |          Payload Data         |
-  +-------------------------------- - - - - - - - - - - - - - - - +
-  :                     Payload Data continued ...                :
-  + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
-  |                     Payload Data continued ...                |
-  +---------------------------------------------------------------+
-  ]#
-
-  MsgReader = ref object
-    tcpSocket: StreamTransport
-    readErr: IOError
-    readLen: uint64
-    readRemaining: uint64
-    readFinal:     bool  ## true the current message has more frames.
-    opcode: Opcode ## Defines the interpretation of the "Payload data".
-    maskKey: array[4, char] ## Masking key
-    mask: bool ## Defines whether the "Payload data" is masked.
-
-  Frame = ref object
-    fin: bool ## Indicates that this is the final fragment in a message.
-    rsv1: bool ## MUST be 0 unless negotiated that defines meanings
-    rsv2: bool ## MUST be 0
-    rsv3: bool ## MUST be 0
-    opcode: Opcode ## Defines the interpretation of the "Payload data".
-    mask: bool ## Defines whether the "Payload data" is masked.
-    data: seq[byte] ## Payload data
-    maskKey: array[4, char] ## Masking key
-    length: uint64 ## Message size.
 
 proc encodeFrame(f: Frame): seq[byte] =
   ## Encodes a frame into a string buffer.
@@ -205,8 +199,11 @@ proc encodeFrame(f: Frame): seq[byte] =
   ret.add(data)
   return ret
 
-proc send*(ws: WebSocket, data: seq[byte], opcode = Opcode.Text): Future[
-    void] {.async.} =
+proc send*(
+  ws: WebSocket,
+  data: seq[byte],
+  opcode = Opcode.Text): Future[void] {.async.} =
+  ## Send a frame
   try:
     var maskKey: array[4, char]
     if ws.masked:
@@ -240,88 +237,15 @@ proc send*(ws: WebSocket, data: seq[byte], opcode = Opcode.Text): Future[
 proc sendStr*(ws: WebSocket, data: string, opcode = Opcode.Text): Future[void] =
   send(ws, toBytes(data), opcode)
 
-proc readFrame(ws: WebSocket): Future[Frame] {.async.} =
-  ## Gets a frame from the WebSocket.
-  ## See https://tools.ietf.org/html/rfc6455#section-5.2
-
-  # Grab the header.
-  var header = newSeq[byte](2)
-  try:
-    await ws.tcpSocket.readExactly(addr header[0], 2)
-  except TransportUseClosedError:
-    ws.readyState = Closed
-    raise newException(WebSocketError, "Socket closed")
-
-  if header.len != 2:
-    ws.readyState = Closed
-    raise newException(WebSocketError, "Invalid websocket header length")
-
-  let b0 = header[0].uint8
-  let b1 = header[1].uint8
-
-  var frame: Frame
-  # Read the flags and fin from the header.
-
-  var hf = cast[HeaderFlags](b0 shr 4)
-  frame.fin = fin in hf
-  frame.rsv1 = rsv1 in hf
-  frame.rsv2 = rsv2 in hf
-  frame.rsv3 = rsv3 in hf
-
-  var opcode = b0 and 0x0f
-  if opcode notin WSOpCode:
-    raise newException(WebSocketError, "Unexpected  websocket opcode")
-  frame.opcode = (opcode).Opcode
-
-  # If any of the rsv are set close the socket.
-  if frame.rsv1 or frame.rsv2 or frame.rsv3:
-    ws.readyState = Closed
-    raise newException(WebSocketError, "WebSocket rsv mismatch")
-
-  # Payload length can be 7 bits, 7+16 bits, or 7+64 bits.
-  var finalLen: uint64 = 0
-
-  let headerLen = uint(b1 and 0x7f)
-  if headerLen == 0x7e:
-    # Length must be 7+16 bits.
-    var length = newSeq[byte](2)
-    await ws.tcpSocket.readExactly(addr length[0], 2)
-    finalLen = cast[ptr uint16](length[0].addr)[].toBE
-  elif headerLen == 0x7f:
-    # Length must be 7+64 bits.
-    var length = newSeq[byte](8)
-    await ws.tcpSocket.readExactly(addr length[0], 8)
-    finalLen = cast[ptr uint64](length[0].addr)[].toBE
-  else:
-    # Length must be 7 bits.
-    finalLen = headerLen
-  frame.length = finalLen
-
-  # Do we need to apply mask?
-  frame.mask = (b1 and 0x80) == 0x80
-
-  if ws.masked == frame.mask:
-    # Server sends unmasked but accepts only masked.
-    # Client sends masked but accepts only unmasked.
-    raise newException(WebSocketError, "Socket mask mismatch")
-
-  var maskKey = newSeq[byte](4)
-  if frame.mask:
-    # Read the mask.
-    await ws.tcpSocket.readExactly(addr maskKey[0], 4)
-    for i in 0..<maskKey.len:
-      frame.maskKey[i] = cast[char](maskKey[i])
-
-  if (frame.opcode == Text) or (frame.opcode == Opcode.Cont) or (frame.opcode == Opcode.Binary) :
-    return frame
-
-  # TODO: Add check for max size for control frames.
-  var data = newSeq[byte](finalLen)
+proc handleControl(ws: WebSocket, frame: Frame) {.async.} =
+  ## handle control frames
+  ##
+  var data = newSeq[byte](frame.length)
 
   # Read control frame payload.
-  if frame.length > 0 :
+  if frame.length > 0:
     # Read the data.
-    await ws.tcpSocket.readExactly(addr data[0], int finalLen)
+    await ws.tcpSocket.readExactly(addr data[0], int frame.length)
     frame.data = data
 
   # Process control frame payload.
@@ -332,7 +256,85 @@ proc readFrame(ws: WebSocket): Future[Frame] {.async.} =
   elif frame.opcode == Close:
     await ws.close(false)
 
-  return frame
+proc readFrame(ws: WebSocket): Future[Frame] {.async.} =
+  ## Gets a frame from the WebSocket.
+  ## See https://tools.ietf.org/html/rfc6455#section-5.2
+
+  while true: # read until a data frame arrives
+    # Grab the header.
+    var header = newSeq[byte](2)
+    try:
+      await ws.tcpSocket.readExactly(addr header[0], 2)
+    except TransportUseClosedError:
+      ws.readyState = Closed
+      raise newException(WebSocketError, "Socket closed")
+
+    if header.len != 2:
+      ws.readyState = Closed
+      raise newException(WebSocketError, "Invalid websocket header length")
+
+    let b0 = header[0].uint8
+    let b1 = header[1].uint8
+
+    var frame: Frame
+    # Read the flags and fin from the header.
+
+    var hf = cast[HeaderFlags](b0 shr 4)
+    frame.fin = fin in hf
+    frame.rsv1 = rsv1 in hf
+    frame.rsv2 = rsv2 in hf
+    frame.rsv3 = rsv3 in hf
+
+    var opcode = b0 and 0x0f
+    if opcode notin WSOpCode:
+      raise newException(WebSocketError, "Unexpected  websocket opcode")
+    frame.opcode = (opcode).Opcode
+
+    # If any of the rsv are set close the socket.
+    if frame.rsv1 or frame.rsv2 or frame.rsv3:
+      ws.readyState = Closed
+      raise newException(WebSocketError, "WebSocket rsv mismatch")
+
+    # Payload length can be 7 bits, 7+16 bits, or 7+64 bits.
+    var finalLen: uint64 = 0
+
+    let headerLen = uint(b1 and 0x7f)
+    if headerLen == 0x7e:
+      # Length must be 7+16 bits.
+      var length = newSeq[byte](2)
+      await ws.tcpSocket.readExactly(addr length[0], 2)
+      finalLen = cast[ptr uint16](length[0].addr)[].toBE
+    elif headerLen == 0x7f:
+      # Length must be 7+64 bits.
+      var length = newSeq[byte](8)
+      await ws.tcpSocket.readExactly(addr length[0], 8)
+      finalLen = cast[ptr uint64](length[0].addr)[].toBE
+    else:
+      # Length must be 7 bits.
+      finalLen = headerLen
+    frame.length = finalLen
+
+    # Do we need to apply mask?
+    frame.mask = (b1 and 0x80) == 0x80
+
+    if ws.masked == frame.mask:
+      # Server sends unmasked but accepts only masked.
+      # Client sends masked but accepts only unmasked.
+      raise newException(WebSocketError, "Socket mask mismatch")
+
+    var maskKey = newSeq[byte](4)
+    if frame.mask:
+      # Read the mask.
+      await ws.tcpSocket.readExactly(addr maskKey[0], 4)
+      for i in 0..<maskKey.len:
+        frame.maskKey[i] = cast[char](maskKey[i])
+
+    # return the current frame if it's not one of the control frames
+    if frame.opcode notin {Opcode.Text, Opcode.Cont, Opcode.Binary}:
+      asyncSpawn ws.handleControl(frame) # process control frames
+      continue
+
+    return frame
 
 proc close*(ws: WebSocket, initiator: bool = true) {.async.} =
   ## Close the Socket, sends close packet.
@@ -347,58 +349,31 @@ proc close*(ws: WebSocket, initiator: bool = true) {.async.} =
       echo "Different packet type"
   await ws.close()
 
-proc readMessage*(msgReader: MsgReader,data: seq[byte]): MsgReader {.async.} =
-  while msgReader.readErr == nil:
-    if msgReader.readRemaining > 0 :
-      len = size(data)
-      if len > msgReader.readRemaining:
-        len = msgReader.readRemaining
+proc tryRead*(
+  ws: WebSocket,
+  data: pointer,
+  size: int): Future[int] {.async.} =
+  ## attempt to read data from a frame
+  ##
 
-      await msgReader.tcpSocket.readExactly(addr data, len)
-      msgReader.readRemaining = msgReader.readRemaining - len
-      msgReader.readLen = len
+  # we might have to read more
+  # than one frame to fill the buffer
+  var consumed = 0
+  while consumed <= size:
+    if isNil(ws.frame) or # no previous frame
+      (not isNil(ws.frame) and ws.frame.remainder() <= 0): # all has been consumed
+      ws.frame = await ws.readFrame()
 
-      if msgReader.mask:
-        # Apply mask, if we need too.
-        for i in 0 ..< len:
-          data[i] = (data[i].uint8 xor msgReader.maskKey[i mod 4].uint8)
+    if ws.frame.remainder > 0:
+      let length = min(size, ws.frame.remainder().int)
+      let read = await ws.tcpSocket.readOnce(data, length)
+      if read <= 0: # probably EOF
+        return consumed
 
-      if msgReader.readRemaining == 0:
-        msgReader.readErr = EOFError
+      ws.frame.consumed += read.uint64 # yayks
+      consumed += read
 
-      return msgReader
-
-    if msgReader.readFinal:
-      msgReader.readLen = 0
-      msgReader.readErr = EOFError
-      return msgReader
-
-    var frame = await ws.readFrame()
-    if frame.fin:
-      msgReader.readFinal = true
-    msgReader.readRemaining = frame.length
-
-    # Non-control frames cannot occur in the middle of a fragmented non-control frame.
-    if frame.Opcode in Text || Binary:
-      raise newException("websocket: internal error, unexpected text or binary in Reader")
-  return msgReader
-
-proc nextMessageReader*(ws: WebSocket): MsgReader =
-  while true:
-    # Handle control frames and return only on non control frames.
-    var frame = await ws.readFrame()
-    if frame.Opcode in Text || Binary:
-      var msgReader: MsgReader
-      msgReader.readFinal =  frame.fin
-      msgReader.readRemaining = frame.readRemaining
-      msgReader.tcpSocket = ws.tcpSocket
-      msgReader.mask = frame.mask
-      msgReader.maskKey = frame.maskKey
-      return msgReader
-
-proc receiveStrPacket*(ws: WebSocket): Future[seq[byte]] {.async.} =
-  # TODO: remove this once PR is approved.
-  return nil
+  return consumed
 
 proc validateWSClientHandshake*(transp: StreamTransport,
     header: HttpResponseHeader): void =
