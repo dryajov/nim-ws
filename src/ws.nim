@@ -1,6 +1,17 @@
-import httputils, strutils, base64, std/sha1, ./random, http, uri,
-  chronos/timer, tables, stew/byteutils, eth/[keys], stew/endians2,
-  parseutils, stew/base64 as stewBase, chronos
+import std/[tables,
+            strutils,
+            uri,
+            sha1,
+            parseutils]
+
+import pkg/[chronos,
+            httputils,
+            stew/byteutils,
+            stew/endians2,
+            stew/base64,
+            eth/keys]
+
+import ./random, ./http
 
   #[
   +---------------------------------------------------------------+
@@ -27,7 +38,8 @@ import httputils, strutils, base64, std/sha1, ./random, http, uri,
 const
   SHA1DigestSize = 20
   WSHeaderSize = 12
-  WSOpCode = {0x00, 0x01, 0x02, 0x08, 0x09, 0x0a}
+  WSDefaultVersion = 13
+  WSDefaultFrameSize* = 1024 * 1024 # 1kb
 
 type
   ReadyState* = enum
@@ -90,11 +102,17 @@ func remainder(frame: Frame): uint64 =
 # Forward declare
 proc close*(ws: WebSocket, initiator: bool = true) {.async.}
 
-proc handshake*(ws: WebSocket, header: HttpRequestHeader) {.async.} =
+proc handshake*(
+  ws: WebSocket,
+  header: HttpRequestHeader,
+  version = WSDefaultVersion) {.async.} =
   ## Handles the websocket handshake.
+  ##
+
   discard parseSaturatedNatural(header["Sec-WebSocket-Version"], ws.version)
-  if ws.version != 13:
-    raise newException(WebSocketError, "Websocket version not supported, Version: " &
+  if ws.version != version:
+    raise newException(WebSocketError,
+      "Websocket version not supported, Version: " &
       header["Sec-WebSocket-Version"])
 
   ws.key = header["Sec-WebSocket-Key"].strip()
@@ -108,10 +126,11 @@ proc handshake*(ws: WebSocket, header: HttpRequestHeader) {.async.} =
   var acceptKey: string
   try:
     let sh = secureHash(ws.key & "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-    acceptKey = stewBase.Base64.encode(hexToByteArray[SHA1DigestSize]($sh))
+    acceptKey = Base64.encode(hexToByteArray[SHA1DigestSize]($sh))
   except ValueError:
     raise newException(
-      WebSocketError, "Failed to generate accept key: " & getCurrentExceptionMsg())
+      WebSocketError,
+      "Failed to generate accept key: " & getCurrentExceptionMsg())
 
   var response = "HTTP/1.1 101 Web Socket Protocol Handshake" & CRLF
   response.add("Sec-WebSocket-Accept: " & acceptKey & CRLF)
@@ -127,14 +146,22 @@ proc handshake*(ws: WebSocket, header: HttpRequestHeader) {.async.} =
     raise newException(WebSocketError, "Failed to send handshake response to client")
   ws.readyState = Open
 
-proc newWebSocket*(header: HttpRequestHeader, transp: StreamTransport,
-                    protocol: string = ""): Future[WebSocket] {.async.} =
+proc createServer*(
+  header: HttpRequestHeader,
+  transp: StreamTransport,
+  protocol: string = ""): Future[WebSocket] {.async.} =
   ## Creates a new socket from a request.
+  ##
+
+  if not header.contains("Sec-WebSocket-Version"):
+    raise newException(WebSocketError, "Invalid WebSocket handshake")
+
   try:
-    if not header.contains("Sec-WebSocket-Version"):
-      raise newException(WebSocketError, "Invalid WebSocket handshake")
-    var ws = WebSocket(tcpSocket: transp, protocol: protocol, masked: false,
-        rng: newRng())
+    var ws = WebSocket(
+      tcpSocket: transp,
+      protocol: protocol,
+      masked: false,
+      rng: newRng())
     await ws.handshake(header)
     return ws
   except ValueError, KeyError:
@@ -152,20 +179,20 @@ proc encodeFrame(f: Frame): seq[byte] =
 
   var b0 = (f.opcode.uint8 and 0x0f) # 0th byte: opcodes and flags.
   if f.fin:
-    b0 = b0 or 128u8
+    b0 = b0 or 128'u8
 
   ret.add(b0)
 
   # Payload length can be 7 bits, 7+16 bits, or 7+64 bits.
   # 1st byte: payload len start and mask bit.
-  var b1 = 0u8
+  var b1 = 0'u8
 
   if f.data.len <= 125:
     b1 = f.data.len.uint8
   elif f.data.len > 125 and f.data.len <= 0xffff:
-    b1 = 126u8
+    b1 = 126'u8
   else:
-    b1 = 127u8
+    b1 = 127'u8
 
   if f.mask:
     b1 = b1 or (1 shl 7)
@@ -204,6 +231,8 @@ proc send*(
   data: seq[byte],
   opcode = Opcode.Text): Future[void] {.async.} =
   ## Send a frame
+  ##
+
   try:
     var maskKey: array[4, char]
     if ws.masked:
@@ -218,6 +247,7 @@ proc send*(
        mask: ws.masked,
        data: data,
        maskKey: maskKey)
+
     var frame = encodeFrame(inFrame)
     const maxSize = 1024*1024
     # Send stuff in 1 megabyte chunks to prevent IOErrors.
@@ -234,8 +264,8 @@ proc send*(
     raise newException(WebSocketError, "Failed to send data: " &
         getCurrentExceptionMsg())
 
-proc sendStr*(ws: WebSocket, data: string, opcode = Opcode.Text): Future[void] =
-  send(ws, toBytes(data), opcode)
+proc send*(ws: WebSocket, data: string): Future[void] =
+  send(ws, toBytes(data), Opcode.Text)
 
 proc handleControl(ws: WebSocket, frame: Frame) {.async.} =
   ## handle control frames
@@ -276,7 +306,7 @@ proc readFrame(ws: WebSocket): Future[Frame] {.async.} =
     let b0 = header[0].uint8
     let b1 = header[1].uint8
 
-    var frame: Frame
+    var frame = Frame()
     # Read the flags and fin from the header.
 
     var hf = cast[HeaderFlags](b0 shr 4)
@@ -285,10 +315,7 @@ proc readFrame(ws: WebSocket): Future[Frame] {.async.} =
     frame.rsv2 = rsv2 in hf
     frame.rsv3 = rsv3 in hf
 
-    var opcode = b0 and 0x0f
-    if opcode notin WSOpCode:
-      raise newException(WebSocketError, "Unexpected  websocket opcode")
-    frame.opcode = (opcode).Opcode
+    frame.opcode = (b0 and 0x0f).Opcode
 
     # If any of the rsv are set close the socket.
     if frame.rsv1 or frame.rsv2 or frame.rsv3:
@@ -349,43 +376,56 @@ proc close*(ws: WebSocket, initiator: bool = true) {.async.} =
       echo "Different packet type"
   await ws.close()
 
-proc tryRead*(
+proc recv*(
   ws: WebSocket,
   data: pointer,
-  size: int): Future[int] {.async.} =
-  ## attempt to read data from a frame
+  max: int): Future[int] {.async.} =
+  ## Attempts to read up to `max` bytes
+  ## otherwise, returns what it could read.
+  ##
+  ## If no data is available in the pipe,
+  ## it will await until at least 1 byte
+  ## is available
   ##
 
   # we might have to read more
   # than one frame to fill the buffer
-  var consumed = 0
-  while consumed <= size:
-    if isNil(ws.frame) or # no previous frame
-      (not isNil(ws.frame) and ws.frame.remainder() <= 0): # all has been consumed
-      ws.frame = await ws.readFrame()
+  if isNil(ws.frame) or # no previous frame
+    (not isNil(ws.frame) and ws.frame.remainder() <= 0): # all has been consumed
+    ws.frame = await ws.readFrame()
 
-    if ws.frame.remainder > 0:
-      let length = min(size, ws.frame.remainder().int)
-      let read = await ws.tcpSocket.readOnce(data, length)
-      if read <= 0: # probably EOF
-        return consumed
+  var read = 0
+  if ws.frame.remainder > 0:
+    let length = min(max, ws.frame.remainder().int)
+    read = await ws.tcpSocket.readOnce(data, length)
 
-      ws.frame.consumed += read.uint64 # yayks
-      consumed += read
+    var castData = cast[ptr UncheckedArray[byte]](data)
+    for i in 0 ..< read:
+      let offset = ws.frame.consumed.int + i
+      castData[i] = (castData[offset].uint8 xor ws.frame.maskKey[offset mod 4].uint8)
 
-  return consumed
+    ws.frame.consumed += read.uint64 # yayks
 
-proc validateWSClientHandshake*(transp: StreamTransport,
-    header: HttpResponseHeader): void =
+  return read
+
+proc validateWSClientHandshake(
+  transp: StreamTransport,
+  header: HttpResponseHeader): void =
   if header.code != ord(Http101):
-    raise newException(WebSocketError, "Server did not reply with a websocket upgrade: " &
+    raise newException(WebSocketError,
+          "Server did not reply with a websocket upgrade: " &
           "Header code: " & $header.code &
           "Header reason: " & header.reason() &
           "Address: " & $transp.remoteAddress())
 
-proc newWebsocketClient*(uri: Uri, protocols: seq[string] = @[]): Future[
-    WebSocket] {.async.} =
-  var key = encode(genWebSecKey(newRng()))
+proc connect*(
+  uri: Uri,
+  protocols: seq[string] = @[],
+  version = WSDefaultVersion): Future[WebSocket] {.async.} =
+  ## create a new websockets client
+  ##
+
+  var key = Base64.encode(genWebSecKey(newRng()))
   var uri = uri
   case uri.scheme
   of "ws":
@@ -397,9 +437,10 @@ proc newWebsocketClient*(uri: Uri, protocols: seq[string] = @[]): Future[
     "Connection": "Upgrade",
     "Upgrade": "websocket",
     "Cache-Control": "no-cache",
-    "Sec-WebSocket-Version": "13",
+    "Sec-WebSocket-Version": $version,
     "Sec-WebSocket-Key": key
   })
+
   if protocols.len != 0:
     headers.table["Sec-WebSocket-Protocol"] = @[protocols.join(", ")]
 
@@ -410,17 +451,25 @@ proc newWebsocketClient*(uri: Uri, protocols: seq[string] = @[]): Future[
     # Header could not be parsed
     raise newException(WebSocketError, "Malformed header received: " &
         $client.transp.remoteAddress())
+
   client.transp.validateWSClientHandshake(header)
 
   # Client data should be masked.
-  return WebSocket(tcpSocket: client.transp, readyState: Open, masked: true,
-      rng: newRng())
+  return WebSocket(
+    tcpSocket: client.transp,
+    readyState: Open,
+    masked: true,
+    rng: newRng())
 
-proc newWebsocketClient*(host: string, port: Port, path: string,
-    protocols: seq[string] = @[]): Future[WebSocket] {.async.} =
+proc connect*(
+  host: string,
+  port: Port,
+  path: string,
+  protocols: seq[string] = @[]): Future[WebSocket] {.async.} =
   var uri = "ws://" & host & ":" & $port
   if path.startsWith("/"):
     uri.add path
   else:
     uri.add "/" & path
-  return await newWebsocketClient(parseUri(uri), protocols)
+
+  return await connect(parseUri(uri), protocols)
